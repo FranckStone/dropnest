@@ -3,6 +3,7 @@ import PDFKit
 import Vision
 import ImageIO
 import AppKit
+import DropNestCore
 
 struct ExtractedText: Sendable {
     var text = ""
@@ -59,18 +60,8 @@ enum FileTextExtractor {
             let output = command("/usr/bin/textutil", ["-convert", "txt", "-stdout", url.path], cap: limit * 4)
             raw = String(decoding: output.data, as: UTF8.self); truncated = output.truncated
         } else if ["xlsx", "pptx"].contains(ext) {
-            let names = command("/usr/bin/unzip", ["-Z1", url.path], cap: 200_000)
-            let entries = String(decoding: names.data, as: UTF8.self).split(separator: "\n").map(String.init).filter {
-                ext == "xlsx" ? ($0 == "xl/sharedStrings.xml" || $0.hasPrefix("xl/worksheets/sheet") && $0.hasSuffix(".xml")) : ($0.hasPrefix("ppt/slides/slide") && $0.hasSuffix(".xml"))
-            }.sorted().prefix(100)
-            for entry in entries {
-                let output = command("/usr/bin/unzip", ["-p", url.path, entry], cap: limit * 6)
-                let delegate = OfficeXMLText()
-                let parser = XMLParser(data: output.data); parser.delegate = delegate
-                parser.shouldResolveExternalEntities = false
-                _ = parser.parse()
-                raw += delegate.text + "\n"
-                if output.truncated || raw.count >= limit { truncated = true; break }
+            if let office = OfficeText.extract(url, pptx: ext == "pptx", limit: limit) {
+                raw = office.text; truncated = office.truncated
             }
         } else if imageExtensions.contains(ext),
                   let source = CGImageSourceCreateWithURL(url as CFURL, nil),
@@ -127,17 +118,5 @@ enum FileTextExtractor {
         process.waitUntilExit()
         guard process.terminationStatus == 0 || truncated else { return (Data(), false) }
         return (Data(data.prefix(cap)), truncated)
-    }
-}
-
-private final class OfficeXMLText: NSObject, XMLParserDelegate {
-    var text = ""
-    private var capture = false
-    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
-        capture = elementName == "t" || elementName == "a:t" || elementName == "v"
-    }
-    func parser(_ parser: XMLParser, foundCharacters string: String) { if capture { text += string } }
-    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
-        if capture { text += " " }; capture = false
     }
 }

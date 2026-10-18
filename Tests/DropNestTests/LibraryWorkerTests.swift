@@ -71,6 +71,35 @@ final class LibraryWorkerTests: XCTestCase {
         let extracted = FileTextExtractor.extract(file, limit: 100)
         XCTAssertEqual(extracted.text.count, 100); XCTAssertTrue(extracted.truncated)
     }
+    func testOfficeArchivesAreReadInProcess() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("DropNest-Office-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: base) }
+        func pack(_ name: String, _ entries: [String: String]) throws -> URL {
+            let folder = base.appendingPathComponent(name + "-src")
+            for (path, body) in entries {
+                let url = folder.appendingPathComponent(path)
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try body.write(to: url, atomically: true, encoding: .utf8)
+            }
+            let output = base.appendingPathComponent(name)
+            let zip = Process(); zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+            zip.arguments = ["-qr", output.path, "."]; zip.currentDirectoryURL = folder
+            try zip.run(); zip.waitUntilExit()
+            XCTAssertEqual(zip.terminationStatus, 0)
+            return output
+        }
+        let xlsx = try pack("报表.xlsx", ["xl/sharedStrings.xml": "<sst><si><t>客户 &amp; 预算</t></si></sst>",
+                                         "xl/worksheets/sheet1.xml": "<w><c><v>2026</v></c></w>",
+                                         "docProps/core.xml": "<t>不应出现</t>"])
+        let sheet = FileTextExtractor.extract(xlsx)
+        XCTAssertEqual(sheet.text, "客户 & 预算 \n2026 \n"); XCTAssertFalse(sheet.truncated)
+        let pptx = try pack("汇报.pptx", ["ppt/slides/slide1.xml": "<p:sld><a:t>季度汇报</a:t></p:sld>"])
+        XCTAssertTrue(FileTextExtractor.extract(pptx).text.contains("季度汇报"))
+        XCTAssertTrue(FileTextExtractor.extract(xlsx, limit: 3).truncated)
+        let fake = base.appendingPathComponent("假.xlsx")
+        try "not a zip".write(to: fake, atomically: true, encoding: .utf8)
+        XCTAssertEqual(FileTextExtractor.extract(fake).text, "")
+    }
     func testRTFExtraction() throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("DropNest-RTF-\(UUID()).rtf")
         defer { try? FileManager.default.removeItem(at: file) }

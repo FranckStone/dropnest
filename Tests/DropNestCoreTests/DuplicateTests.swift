@@ -63,6 +63,24 @@ final class DuplicateTests: XCTestCase {
         XCTAssertEqual(groups.count, 1)
         XCTAssertEqual(Set(groups[0].documents.map(\.path)), ["甲.txt", "子目录/乙.txt"])
     }
+    func testParallelHashingAcrossBatchesKeepsGroupsAndCollisionsApart() throws {
+        // 90 same-size files span three hash batches: 30 copies each of three
+        // contents, plus same-size files whose bytes differ.
+        for index in 0..<90 {
+            _ = try write("archive/组\(index % 3)/\(index).bin", data: Data(repeating: UInt8(index % 3), count: 4096))
+        }
+        for index in 0..<5 {
+            var bytes = Data(repeating: 9, count: 4096); bytes[4095] = UInt8(index)
+            _ = try write("archive/单独/\(index).bin", data: bytes)
+        }
+        var reported: [(Int, Int)] = []
+        let lock = NSLock()
+        let groups = try DuplicateFiles.groups(root: root) { current, total in lock.lock(); reported.append((current, total)); lock.unlock() }
+        XCTAssertEqual(groups.count, 3)
+        XCTAssertEqual(groups.map(\.documents.count), [30, 30, 30])
+        for group in groups { XCTAssertEqual(Set(group.documents.map { $0.path.split(separator: "/")[0] }).count, 1) }
+        XCTAssertEqual(reported.last?.0, 95); XCTAssertEqual(reported.last?.1, 95)
+    }
     func testPendingCheckExcludesItselfButFindsAnotherCopy() throws {
         let source = try write("archive/待整理/a.txt", data: Data("same".utf8))
         XCTAssertNil(try DuplicateFiles.match(source: source, root: root))

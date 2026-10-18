@@ -107,14 +107,33 @@ public enum DuplicateFiles {
         let candidates = bySize.values.filter { $0.count > 1 }.flatMap { $0 }
         var byDigest: [Data: [[LibraryDocument]]] = [:]
         var stamps: [String: FileStamp] = [:]
-        for (index, document) in candidates.enumerated() {
+        var digests: [String: Data] = [:]
+        // Hash in parallel batches; between batches the scan can be cancelled
+        // and progress reported.
+        let batchSize = 32
+        for start in stride(from: 0, to: candidates.count, by: batchSize) {
+            try Task.checkCancellation()
+            let batch = candidates[start..<min(start + batchSize, candidates.count)]
+            let urls = try batch.map { try file($0, root: root) }
+            let before = try zip(batch, urls).map { document, url in
+                let stamp = try FileStamp.read(url)
+                guard stamp.size == UInt64(document.size), stamp.modified == document.modified else { throw unreadable(url) }
+                return stamp
+            }
+            let hashes = RustDigest.sha256(urls)
+            for (index, document) in batch.enumerated() {
+                let url = urls[index]
+                guard let hash = hashes[index] else { throw unreadable(url) }
+                guard try FileStamp.read(url) == before[index] else { throw unreadable(url) }
+                stamps[document.path] = before[index]
+                digests[document.path] = hash
+            }
+            progress(min(start + batchSize, candidates.count), candidates.count)
+        }
+        for document in candidates {
             try Task.checkCancellation()
             let url = try file(document, root: root)
-            let before = try FileStamp.read(url)
-            guard before.size == UInt64(document.size), before.modified == document.modified else { throw unreadable(url) }
-            let hash = try digest(url)
-            guard try FileStamp.read(url) == before else { throw unreadable(url) }
-            stamps[document.path] = before
+            let hash = digests[document.path]!
             var groups = byDigest[hash] ?? []
             var match: Int?
             for group in groups.indices {
@@ -123,7 +142,6 @@ public enum DuplicateFiles {
             if let match { groups[match].append(document) }
             else { groups.append([document]) }
             byDigest[hash] = groups
-            if index % 10 == 0 || index + 1 == candidates.count { progress(index + 1, candidates.count) }
         }
         return byDigest.flatMap { digest, groups in
             groups.filter { $0.count > 1 }.map { documents in

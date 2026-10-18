@@ -49,41 +49,25 @@ public struct LibrarySnapshot: Codable, Sendable {
 
 public enum LibraryScanner {
     /// Metadata only; never follows symlinks or enters application packages.
+    /// The walk itself runs in parallel in the Rust core.
     public static func scan(root: URL, maxEntries: Int = 20_000) throws -> LibrarySnapshot {
         let root = root.standardizedFileURL.resolvingSymlinksInPath()
         guard try root.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
             throw ArchiveError.invalid("归档位置不是有效的文件夹。")
         }
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .fileSizeKey, .contentModificationDateKey]
-        var incomplete = false
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles, .skipsPackageDescendants], errorHandler: { _, _ in incomplete = true; return true }) else {
-            throw ArchiveError.invalid("无法读取归档目录。")
-        }
+        let result = try RustScanner.scan(root: root, maxEntries: maxEntries, maxDepth: 24)
         var folders: [String] = []
         var documents: [LibraryDocument] = []
-        var count = 0
-        for case let url as URL in enumerator {
-            count += 1
-            if count > maxEntries { incomplete = true; break }
-            do {
-                let values = try url.resourceValues(forKeys: Set(keys))
-                // FileManager does not descend into symlinks. Calling
-                // skipDescendants on a non-directory can skip the next real folder.
-                if values.isSymbolicLink == true { continue }
-                if values.isDirectory == true && url.lastPathComponent == "node_modules" { enumerator.skipDescendants(); incomplete = true; continue }
-                let normalized = url.standardizedFileURL.resolvingSymlinksInPath()
-                guard normalized.path.hasPrefix(root.path + "/") else { continue }
-                let relative = String(normalized.path.dropFirst(root.path.count + 1))
-                if values.isDirectory == true && values.isPackage != true {
-                    if relative.split(separator: "/").count > 24 { enumerator.skipDescendants(); incomplete = true; continue }
-                    if RuleEngine.validateFolder(relative) { folders.append(relative) }
-                } else if values.isRegularFile == true || values.isPackage == true {
-                    documents.append(LibraryDocument(path: relative, size: Int64(values.fileSize ?? 0), modified: values.contentModificationDate ?? .distantPast))
-                }
-            } catch { incomplete = true }
+        for entry in result.entries {
+            switch entry.kind {
+            case .folder:
+                if RuleEngine.validateFolder(entry.relativePath) { folders.append(entry.relativePath) }
+            case .file, .package:
+                documents.append(LibraryDocument(path: entry.relativePath, size: entry.size, modified: entry.modified))
+            }
         }
-        return LibrarySnapshot(rootPath: root.path, folders: folders.sorted(), documents: documents.sorted { $0.path < $1.path }, updated: Date(), incomplete: incomplete)
+        return LibrarySnapshot(rootPath: root.path, folders: folders.sorted(), documents: documents.sorted { $0.path < $1.path },
+                               updated: Date(), incomplete: result.incomplete)
     }
 }
 

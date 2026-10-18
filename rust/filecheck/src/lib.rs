@@ -1,9 +1,13 @@
+mod office;
+mod scan;
+
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::ffi::{c_char, CStr};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const CHUNK: usize = 64 * 1024;
 
@@ -114,6 +118,140 @@ pub unsafe extern "C" fn dn_files_equal(left: *const c_char, right: *const c_cha
         }
     })
     .unwrap_or(-1)
+}
+
+
+unsafe fn path_from<'a>(path: *const c_char) -> &'a Path {
+    Path::new(std::ffi::OsStr::from_bytes(CStr::from_ptr(path).to_bytes()))
+}
+
+/// Heap bytes handed to Swift; release with `dn_buffer_free`.
+#[repr(C)]
+pub struct DnBuffer {
+    data: *mut u8,
+    len: usize,
+}
+
+impl DnBuffer {
+    const EMPTY: DnBuffer = DnBuffer { data: std::ptr::null_mut(), len: 0 };
+
+    fn from_vec(bytes: Vec<u8>) -> DnBuffer {
+        let boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        DnBuffer { data: Box::into_raw(boxed) as *mut u8, len }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dn_buffer_free(buffer: DnBuffer) {
+    if !buffer.data.is_null() {
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(buffer.data, buffer.len)));
+    }
+}
+
+/// Hashes `count` files in parallel. `digests` holds `count * 32` bytes and
+/// `results[i]` receives 0 or -1 exactly as `dn_sha256_file` would.
+#[no_mangle]
+pub unsafe extern "C" fn dn_sha256_files(
+    paths: *const *const c_char,
+    count: usize,
+    digests: *mut u8,
+    results: *mut i32,
+) -> i32 {
+    if count == 0 {
+        return 0;
+    }
+    if paths.is_null() || digests.is_null() || results.is_null() {
+        return -1;
+    }
+    let owned: Vec<Option<PathBuf>> = (0..count)
+        .map(|index| {
+            let path = *paths.add(index);
+            (!path.is_null()).then(|| path_from(path).to_path_buf())
+        })
+        .collect();
+    let hashed = std::panic::catch_unwind(|| {
+        owned
+            .par_iter()
+            .map(|path| path.as_deref().and_then(|path| fingerprint(path).ok()))
+            .collect::<Vec<_>>()
+    });
+    let Ok(hashed) = hashed else { return -1 };
+    for (index, digest) in hashed.into_iter().enumerate() {
+        match digest {
+            Some(digest) => {
+                std::ptr::copy_nonoverlapping(digest.as_ptr(), digests.add(index * 32), 32);
+                *results.add(index) = 0;
+            }
+            None => *results.add(index) = -1,
+        }
+    }
+    0
+}
+
+/// `kind`: 0 = XLSX, 1 = PPTX. Returns 0 and fills `output` with UTF-8 text,
+/// or -1 when the file is not a readable archive.
+#[no_mangle]
+pub unsafe extern "C" fn dn_office_text(
+    path: *const c_char,
+    kind: i32,
+    limit: usize,
+    output: *mut DnBuffer,
+    truncated: *mut i32,
+) -> i32 {
+    if path.is_null() || output.is_null() || truncated.is_null() {
+        return -1;
+    }
+    *output = DnBuffer::EMPTY;
+    let path = path_from(path);
+    match std::panic::catch_unwind(|| office::office_text(path, kind == 1, limit)) {
+        Ok(Ok((text, cut))) => {
+            *output = DnBuffer::from_vec(text.into_bytes());
+            *truncated = cut as i32;
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Walks `root` (already resolved) and fills `output` with records:
+/// header `u8 incomplete`, then per entry `u8 kind, u64 size, i64 seconds,
+/// i64 nanoseconds, u32 length, path bytes`, all little-endian.
+/// `is_package` is called, possibly from several threads, for directories
+/// whose name contains a dot.
+#[no_mangle]
+pub unsafe extern "C" fn dn_scan_library(
+    root: *const c_char,
+    max_entries: usize,
+    max_depth: usize,
+    is_package: Option<extern "C" fn(*const c_char) -> i32>,
+    output: *mut DnBuffer,
+) -> i32 {
+    if root.is_null() || output.is_null() {
+        return -1;
+    }
+    *output = DnBuffer::EMPTY;
+    let root = path_from(root);
+    let check = |path: &Path| -> bool {
+        let Some(callback) = is_package else { return false };
+        let Ok(bytes) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+        callback(bytes.as_ptr()) == 1
+    };
+    let Ok(result) = std::panic::catch_unwind(|| scan::scan(root, max_entries, max_depth, &check)) else {
+        return -1;
+    };
+    let mut bytes = Vec::with_capacity(1 + result.entries.len() * 64);
+    bytes.push(result.incomplete as u8);
+    for entry in &result.entries {
+        bytes.push(entry.kind);
+        bytes.extend_from_slice(&entry.size.to_le_bytes());
+        bytes.extend_from_slice(&entry.seconds.to_le_bytes());
+        bytes.extend_from_slice(&entry.nanoseconds.to_le_bytes());
+        bytes.extend_from_slice(&(entry.relative.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&entry.relative);
+    }
+    *output = DnBuffer::from_vec(bytes);
+    0
 }
 
 #[cfg(test)]
