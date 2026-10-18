@@ -21,6 +21,7 @@ final class WindowDragTests: XCTestCase {
         config.rootPath = root.path
         config.useAI = false
         config.rules = [SortRule(keyword: "drop-check", folder: "验证归档")]
+        config.folderDropMode = .whole
         defaults.set(try JSONEncoder().encode(config), forKey: "DropNest.Configuration.v1")
         _ = NSApplication.shared
         let model = AppModel(dataDirectory: base.appendingPathComponent("state"), defaults: defaults)

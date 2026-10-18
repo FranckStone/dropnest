@@ -32,6 +32,29 @@ final class RemoteClassifierTests: XCTestCase {
     func reply(_ content: String) throws -> (Int, Data) {
         (200, try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": content]]]]))
     }
+    func testSplitFolderNameIsSentAsAHintOnlyWhenPresent() async throws {
+        let session = transport(); defer { session.invalidateAndCancel() }
+        var prompts: [String] = []
+        MockProtocol.handler = { request in
+            var body = Data()
+            if let stream = request.httpBodyStream {
+                stream.open(); defer { stream.close() }
+                var chunk = [UInt8](repeating: 0, count: 4096)
+                while stream.hasBytesAvailable { let count = stream.read(&chunk, maxLength: chunk.count); if count <= 0 { break }; body.append(chunk, count: count) }
+            }
+            let payload = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+            let messages = payload["messages"] as! [[String: Any]]
+            prompts.append(messages.last!["content"] as! String)
+            return try self.reply(#"{"folder_id":0,"confident":true,"reason":"主题一致"}"#)
+        }
+        let library = LibrarySnapshot(folders: ["客户"])
+        _ = try await RemoteClassifier.route(filename: "协议.docx", excerpt: "合作协议", config: config(), library: library,
+                                             sourceFolder: "星河科技/合同", transport: session)
+        _ = try await RemoteClassifier.route(filename: "协议.docx", excerpt: "合作协议", config: config(), library: library, transport: session)
+        XCTAssertEqual(prompts.count, 2)
+        XCTAssertTrue(prompts[0].hasPrefix("来源文件夹（拖入时所在位置，仅作辅助线索，以内容为主）：星河科技/合同\n文件名：协议.docx"), prompts[0])
+        XCTAssertTrue(prompts[1].hasPrefix("文件名：协议.docx"), prompts[1])
+    }
     func testExistingMatchingFolderDoesNotRequestNewCategory() async throws {
         let session = transport(); defer { session.invalidateAndCancel() }
         var calls = 0

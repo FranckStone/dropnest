@@ -56,6 +56,8 @@ final class AppModel: ObservableObject {
         var fromPending = false
         var invoice: InvoiceContext?
         var expectedStamp: FileStamp?
+        /// Set when the file came out of a split folder; a hint for the classifier.
+        var sourceFolder: String?
     }
     private var queue: [QueuedFile] = []
     private var worker: ArchiveWorker?
@@ -332,6 +334,33 @@ final class AppModel: ObservableObject {
     func enqueue(_ urls: [URL], fromPending: Bool = false) {
         enqueueItems(urls.map { QueuedFile(url: $0, fromPending: fromPending) })
     }
+    /// The drop panel asks how to treat folders only when this is true.
+    func needsFolderChoice(_ urls: [URL]) -> Bool {
+        config.folderDropMode == .ask && urls.contains(where: FolderSplit.isSplittable)
+    }
+    func handleDrop(_ urls: [URL]) {
+        enqueueDrop(urls, split: config.folderDropMode == .split)
+    }
+    /// With `split`, every folder is replaced by the files inside it, each
+    /// classified on its own; the emptied folders stay where they were.
+    func enqueueDrop(_ urls: [URL], split: Bool) {
+        guard split else { enqueue(urls); return }
+        var items: [QueuedFile] = []
+        var splitFolders = 0
+        for url in urls {
+            guard FolderSplit.isSplittable(url) else { items.append(QueuedFile(url: url)); continue }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let files = try FolderSplit.items(in: url, root: root)
+                items += files.map { QueuedFile(url: $0.url, sourceFolder: $0.sourceFolder) }
+                splitFolders += 1
+            } catch { self.error = error.localizedDescription }
+        }
+        if splitFolders > 0 && items.isEmpty { status = "拆分的文件夹里没有可归档的文件。"; return }
+        if splitFolders > 0 { status = "已拆分 \(splitFolders) 个文件夹，共 \(items.count) 个文件待归档。" }
+        enqueueItems(items)
+    }
     private func enqueueItems(_ items: [QueuedFile]) {
         guard root != nil else { error = "请先选择归档位置，再拖入文件。"; return }
         guard worker != nil else { error = "整理记录不可用，暂时无法归档。"; return }
@@ -372,7 +401,7 @@ final class AppModel: ObservableObject {
                     if item.invoice == nil, decision == nil, settings.useAI {
                         let expectedRoot = root.standardizedFileURL.resolvingSymlinksInPath().path
                         if library.rootPath == expectedRoot {
-                            do { decision = try await RemoteClassifier.route(url, config: settings, library: library) }
+                            do { decision = try await RemoteClassifier.route(url, config: settings, library: library, sourceFolder: item.sourceFolder ?? "") }
                             catch { fallbackNote = "AI 未完成目录判断，留待整理"; aiStatus = error.localizedDescription }
                         } else { fallbackNote = "目录索引不可用，留待整理" }
                     }

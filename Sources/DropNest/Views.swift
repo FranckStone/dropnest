@@ -107,7 +107,9 @@ struct DropView: View {
             if DropSnapshotMode.enabled {
                 Color.clear
             } else {
-                DropReceiver(onDrop: { model.enqueue($0) }, onHover: { targeted = $0 })
+                DropReceiver(onDrop: { model.handleDrop($0) }, onHover: { targeted = $0 },
+                             needsFolderChoice: { model.needsFolderChoice($0) },
+                             onFolderChoice: { urls, split in model.enqueueDrop(urls, split: split) })
                     .accessibilityLabel("拖入文件或文件夹自动整理")
             }
         }
@@ -188,23 +190,61 @@ struct DropReceiver: NSViewRepresentable {
     var onDrop: ([URL]) -> Void
     var onHover: (Bool) -> Void
     var onClick: (() -> Void)? = nil
+    /// When it returns true for a drop, a menu asks whether folders move whole or are split.
+    var needsFolderChoice: ([URL]) -> Bool = { _ in false }
+    var onFolderChoice: ([URL], Bool) -> Void = { _, _ in }
     func makeNSView(context: Context) -> Receiver {
         let view = Receiver(); view.registerForDraggedTypes([.fileURL]); updateNSView(view, context: context); return view
     }
-    func updateNSView(_ view: Receiver, context: Context) { view.onDrop = onDrop; view.onHover = onHover; view.onClick = onClick }
+    func updateNSView(_ view: Receiver, context: Context) {
+        view.onDrop = onDrop; view.onHover = onHover; view.onClick = onClick
+        view.needsFolderChoice = needsFolderChoice; view.onFolderChoice = onFolderChoice
+    }
     final class Receiver: NSView {
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         var onDrop: ([URL]) -> Void = { _ in }
         var onHover: (Bool) -> Void = { _ in }
         var onClick: (() -> Void)?
+        var needsFolderChoice: ([URL]) -> Bool = { _ in false }
+        var onFolderChoice: ([URL], Bool) -> Void = { _, _ in }
+        private var pendingChoice: [URL] = []
         override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { onHover(true); return .move }
         override func draggingExited(_ sender: NSDraggingInfo?) { onHover(false) }
         override func draggingEnded(_ sender: NSDraggingInfo) { onHover(false) }
         override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
             onHover(false)
             let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-            guard !urls.isEmpty else { return false }; onDrop(urls); return true
+            guard !urls.isEmpty else { return false }
+            guard needsFolderChoice(urls) else { onDrop(urls); return true }
+            let location = convert(sender.draggingLocation, from: nil)
+            // Let the drag session finish before tracking a menu.
+            DispatchQueue.main.async { [weak self] in self?.askFolderMode(for: urls, at: location) }
+            return true
         }
+        private func askFolderMode(for urls: [URL], at location: NSPoint) {
+            pendingChoice = urls
+            let folders = urls.filter(FolderSplit.isSplittable).count
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            let title = NSMenuItem(title: folders == 1 ? "拖入了 1 个文件夹" : "拖入了 \(folders) 个文件夹", action: nil, keyEquivalent: "")
+            title.isEnabled = false
+            menu.addItem(title)
+            let whole = NSMenuItem(title: "整体归档", action: #selector(chooseWhole), keyEquivalent: "")
+            whole.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+            whole.toolTip = "文件夹作为一个整体移动到合适位置，内部结构不变"
+            let split = NSMenuItem(title: "拆分逐个归档", action: #selector(chooseSplit), keyEquivalent: "")
+            split.image = NSImage(systemSymbolName: "square.split.2x2", accessibilityDescription: nil)
+            split.toolTip = "逐个分析文件夹里的每个文件并分别归档，原文件夹保留在原处"
+            let cancel = NSMenuItem(title: "取消", action: #selector(cancelChoice), keyEquivalent: "")
+            for item in [whole, split, cancel] { item.target = self }
+            menu.addItem(whole); menu.addItem(split); menu.addItem(.separator()); menu.addItem(cancel)
+            // The panel never activates the app on its own; a menu needs it to track clicks.
+            NSApp.activate(ignoringOtherApps: true)
+            menu.popUp(positioning: nil, at: location, in: self)
+        }
+        @objc private func chooseWhole() { onFolderChoice(pendingChoice, false); pendingChoice = [] }
+        @objc private func chooseSplit() { onFolderChoice(pendingChoice, true); pendingChoice = [] }
+        @objc private func cancelChoice() { pendingChoice = [] }
         override func mouseUp(with event: NSEvent) { onClick?() }
     }
 }
@@ -243,6 +283,7 @@ struct SettingsView: View {
         .frame(minWidth: DropTheme.settingsMinWidth, minHeight: DropTheme.settingsMinHeight)
         .tint(DropTheme.accent)
         .onChange(of: model.config.useAI) { _, _ in model.save() }
+        .onChange(of: model.config.folderDropMode) { _, _ in model.save() }
     }
 }
 
@@ -447,6 +488,14 @@ private struct GeneralView: View {
         model.config.rootPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "尚未选择归档总目录"
     }
 
+    private var folderModeDetail: String {
+        switch model.config.folderDropMode {
+        case .ask: "每次拖入文件夹时选择整体归档或拆分"
+        case .whole: "文件夹整体移动，内部结构不变"
+        case .split: "逐个分析其中的文件并分别归档，原文件夹保留在原处"
+        }
+    }
+
     private var searchableCount: Int {
         model.library.documents.filter { !$0.text.isEmpty }.count
     }
@@ -495,7 +544,23 @@ private struct GeneralView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                Text("学习这个总目录下的现有文件夹，按内容归档；没有合适目录时自动新建。原有文件只建立搜索索引；拖入的文件夹整体移动。")
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("拖入文件夹时").font(.system(size: 13))
+                        Text(folderModeDetail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 12)
+                    Picker("拖入文件夹时", selection: $model.config.folderDropMode) {
+                        ForEach(FolderDropMode.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                }
+                Text("学习这个总目录下的现有文件夹，按内容归档；没有合适目录时自动新建。原有文件只建立搜索索引。")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

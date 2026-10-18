@@ -56,8 +56,9 @@ public struct Configuration: Codable, Sendable {
     public var apiModel = "qwen3.5:9b"
     public var allowContentUpload = false
     public var allowDirectoryContextUpload = false
+    public var folderDropMode = FolderDropMode.ask
     public init() {}
-    enum CodingKeys: String, CodingKey { case rootPath, useAI, rules, aiProvider, apiEndpoint, apiModel, allowContentUpload, allowDirectoryContextUpload }
+    enum CodingKeys: String, CodingKey { case rootPath, useAI, rules, aiProvider, apiEndpoint, apiModel, allowContentUpload, allowDirectoryContextUpload, folderDropMode }
     public init(from decoder: Decoder) throws {
         self.init()
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -69,6 +70,20 @@ public struct Configuration: Codable, Sendable {
         apiModel = try c.decodeIfPresent(String.self, forKey: .apiModel) ?? apiModel
         allowContentUpload = try c.decodeIfPresent(Bool.self, forKey: .allowContentUpload) ?? false
         allowDirectoryContextUpload = try c.decodeIfPresent(Bool.self, forKey: .allowDirectoryContextUpload) ?? false
+        folderDropMode = (try? c.decodeIfPresent(FolderDropMode.self, forKey: .folderDropMode)) ?? .ask
+    }
+}
+
+/// How a dropped folder is archived: moved as one item, or split so every
+/// file inside is classified on its own.
+public enum FolderDropMode: String, Codable, Sendable, CaseIterable {
+    case ask, whole, split
+    public var title: String {
+        switch self {
+        case .ask: "每次询问"
+        case .whole: "整体归档"
+        case .split: "拆分逐个归档"
+        }
     }
 }
 
