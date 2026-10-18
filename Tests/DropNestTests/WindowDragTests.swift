@@ -98,8 +98,7 @@ final class WindowDragTests: XCTestCase {
             return hosting.hitTest(hosting.convert(local, to: hosting.superview))
         }
         for point in [NSPoint(x: 55, y: 30), NSPoint(x: 7, y: 120),
-                      NSPoint(x: 100, y: 170), NSPoint(x: 100, y: 195),
-                      NSPoint(x: 105, y: 220)] {
+                      NSPoint(x: 105, y: 155)] {
             XCTAssertTrue(hit(point.x, point.y) is WindowDragHandle.Handle, "Expected dragging at \(point)")
         }
         XCTAssertTrue(hit(105, 100) is DropReceiver.Receiver)

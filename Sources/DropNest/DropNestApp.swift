@@ -19,6 +19,22 @@ final class DropPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+enum SettingsWindowPlacement {
+    static func frame(_ frame: NSRect, in visibleFrame: NSRect, centered: Bool) -> NSRect {
+        var result = frame
+        if centered {
+            result.origin = NSPoint(x: visibleFrame.midX - frame.width / 2,
+                                    y: visibleFrame.midY - frame.height / 2)
+        }
+        // Keep the titlebar reachable, including on displays with negative origins.
+        result.origin.x = min(max(result.minX, visibleFrame.minX),
+                              max(visibleFrame.minX, visibleFrame.maxX - result.width))
+        result.origin.y = min(max(result.minY, visibleFrame.minY),
+                              visibleFrame.maxY - result.height)
+        return result
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var model: AppModel!
@@ -79,12 +95,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func openInvoices() { model.settingsTab = 5; openSettings() }
     @objc func openSettings() {
         model.refreshAI()
+        let isNewWindow = settings == nil
         if settings == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 600), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-            window.title = "落格 · 设置与记录"; window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: SettingsView(model: model)); window.center(); settings = window
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: DropTheme.settingsWidth, height: DropTheme.settingsHeight),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered, defer: false
+            )
+            window.title = "落格"
+            window.isReleasedWhenClosed = false
+            window.titleVisibility = .hidden
+            // Leave titlebar styling and the standard window buttons to AppKit
+            // so they follow the current macOS appearance and interaction states.
+            window.isMovableByWindowBackground = true
+            window.collectionBehavior = [.moveToActiveSpace]
+            window.contentMinSize = NSSize(width: DropTheme.settingsMinWidth, height: DropTheme.settingsMinHeight)
+            window.contentView = NSHostingView(rootView: SettingsView(model: model))
+            settings = window
         }
-        NSApp.activate(ignoringOtherApps: true); settings?.makeKeyAndOrderFront(nil)
+        guard let settings else { return }
+        // NSScreen.main can still refer to the previously focused app's display
+        // when the nonactivating desktop panel is clicked. Use the panel itself.
+        let screen = panel?.screen
+            ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+        if let screen {
+            settings.setFrame(SettingsWindowPlacement.frame(
+                settings.frame, in: screen.visibleFrame,
+                centered: isNewWindow || settings.screen !== screen
+            ), display: true)
+        }
+        if settings.isMiniaturized { settings.deminiaturize(nil) }
+        NSApp.activate(ignoringOtherApps: true)
+        settings.makeKeyAndOrderFront(nil)
     }
     @objc func quitApp() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
