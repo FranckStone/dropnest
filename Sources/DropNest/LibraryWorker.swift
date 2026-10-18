@@ -2,20 +2,22 @@ import Foundation
 import DropNestCore
 
 actor LibraryWorker {
-    private struct StoredIndex: Codable {
-        let version: Int
-        let snapshot: LibrarySnapshot
-    }
-    private static let formatVersion = 1
-    private let storage: URL
+    private var store: LibraryStore
     private var snapshot = LibrarySnapshot()
+    private var searchIndex: LibrarySearchIndex?
+    private var loaded = false
+    /// Reading the stored index is deferred to the first rebuild or search so
+    /// it never runs on the caller's (main) thread.
     init(storage: URL) {
-        self.storage = storage
-        if let data = try? Data(contentsOf: storage), let decoded = try? JSONDecoder().decode(StoredIndex.self, from: data), decoded.version == Self.formatVersion {
-            snapshot = decoded.snapshot
-        }
+        store = LibraryStore(file: storage)
+    }
+    private func ensureLoaded() {
+        guard !loaded else { return }
+        loaded = true
+        snapshot = store.load()
     }
     func rebuild(root: URL, progress: @Sendable (Int, Int) async -> Void) async throws -> LibrarySnapshot {
+        ensureLoaded()
         var next = try LibraryScanner.scan(root: root)
         let previous = snapshot.rootPath == next.rootPath ? Dictionary(uniqueKeysWithValues: snapshot.documents.map { ($0.path, $0) }) : [:]
         var remainingCharacters = 12_000_000
@@ -33,13 +35,17 @@ actor LibraryWorker {
             if index % 10 == 0 { await progress(index + 1, next.documents.count) }
         }
         try Task.checkCancellation()
-        try FileManager.default.createDirectory(at: storage.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(StoredIndex(version: Self.formatVersion, snapshot: next)).write(to: storage, options: .atomic)
+        try store.save(next)
+        searchIndex = LibrarySearchIndex(next, reusing: searchIndex)
         snapshot = next
         return next
     }
     func search(query: String, root: String) -> [LibrarySearchHit] {
+        ensureLoaded()
         guard snapshot.rootPath == root else { return [] }
-        return LibrarySearch.search(snapshot, query: query)
+        if searchIndex == nil { searchIndex = LibrarySearchIndex(snapshot) }
+        return LibrarySearch.search(searchIndex!, query: query)
     }
+    /// Shards rewritten by the most recent rebuild; exposed for tests.
+    var lastWrittenShards: Int { store.lastWrittenShards }
 }

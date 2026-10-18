@@ -45,6 +45,25 @@ final class LibraryWorkerTests: XCTestCase {
         let removed = await worker.search(query: "预付款", root: root.path)
         XCTAssertTrue(removed.isEmpty)
     }
+    func testUnchangedRebuildDoesNotRewriteContentShards() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("DropNest-Shards-\(UUID())")
+        let root = base.appendingPathComponent("files")
+        let storage = base.appendingPathComponent("index.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        for number in 0..<20 { try "第\(number)份报告".write(to: root.appendingPathComponent("\(number).txt"), atomically: true, encoding: .utf8) }
+        _ = try await LibraryWorker(storage: storage).rebuild(root: root) { _, _ in }
+        let worker = LibraryWorker(storage: storage)
+        _ = try await worker.rebuild(root: root) { _, _ in }
+        let unchanged = await worker.lastWrittenShards
+        XCTAssertEqual(unchanged, 0)
+        try "新增的季度预算".write(to: root.appendingPathComponent("new.txt"), atomically: true, encoding: .utf8)
+        _ = try await worker.rebuild(root: root) { _, _ in }
+        let added = await worker.lastWrittenShards
+        XCTAssertEqual(added, 1)
+        let hits = await worker.search(query: "季度预算", root: root.standardizedFileURL.resolvingSymlinksInPath().path)
+        XCTAssertEqual(hits.first?.document.path, "new.txt")
+    }
     func testPlainTextExtractionIsBounded() throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("DropNest-Text-\(UUID()).txt")
         defer { try? FileManager.default.removeItem(at: file) }

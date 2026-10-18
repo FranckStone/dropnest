@@ -66,7 +66,7 @@
 本机数据位置：
 
 - `~/Library/Application Support/DropNest/history.json`：移动及撤销日志。
-- `~/Library/Application Support/DropNest/library.json`：目录结构、文件元数据和可搜索正文。明文存于本机。
+- `~/Library/Application Support/DropNest/library.json`：目录结构和文件元数据；可搜索正文按路径哈希分 64 片存于同目录 `library-content/`，索引更新时只重写有变化的分片。均为明文存于本机，旧版单文件索引会在下次索引更新时自动迁移。
 - macOS UserDefaults：归档位置与选项。
 
 ## 文件保护

@@ -94,9 +94,42 @@ public struct LibrarySearchHit: Identifiable, Sendable {
     public let score: Int
 }
 
+/// Case- and diacritic-folded copies of every path and body, computed once per
+/// index refresh instead of on every keystroke.
+public struct LibrarySearchIndex: Sendable {
+    /// Folded UTF-8 bytes; substring tests run with memmem instead of
+    /// bridging each body to UTF-16 for every term.
+    fileprivate struct Entry: Sendable {
+        let path: [UInt8]
+        let body: [UInt8]
+        /// Folding kept the character count, so a character offset in `body`
+        /// is the same offset in the original text.
+        let aligned: Bool
+    }
+    public let snapshot: LibrarySnapshot
+    fileprivate let entries: [Entry]
+    /// Documents whose text is unchanged since `previous` reuse its folded copy.
+    public init(_ snapshot: LibrarySnapshot, reusing previous: LibrarySearchIndex? = nil) {
+        var cached: [String: (text: String, entry: Entry)] = [:]
+        if let previous {
+            cached.reserveCapacity(previous.entries.count)
+            for (document, entry) in zip(previous.snapshot.documents, previous.entries) { cached[document.path] = (document.text, entry) }
+        }
+        self.snapshot = snapshot
+        entries = snapshot.documents.map { document in
+            if let hit = cached[document.path], hit.text == document.text { return hit.entry }
+            let body = LibrarySearch.fold(document.text)
+            return Entry(path: Array(LibrarySearch.fold(document.path).utf8), body: Array(body.utf8), aligned: body.count == document.text.count)
+        }
+    }
+}
+
 public enum LibrarySearch {
+    static func fold(_ text: String) -> String {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
     public static func tokens(_ query: String) -> [String] {
-        let normalized = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let normalized = fold(query)
         let words = normalized.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
         var result = Set(words)
         for word in words {
@@ -108,37 +141,62 @@ public enum LibrarySearch {
         return result.sorted()
     }
     public static func search(_ snapshot: LibrarySnapshot, query: String) -> [LibrarySearchHit] {
+        search(LibrarySearchIndex(snapshot), query: query)
+    }
+    /// Snippets are built only for the first `snippetLimit` ranked hits, which
+    /// is all the interface shows; later hits carry an empty snippet.
+    public static func search(_ index: LibrarySearchIndex, query: String, snippetLimit: Int = 300) -> [LibrarySearchHit] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let full = fold(query)
         let terms = tokens(query)
-        let full = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-        var results: [LibrarySearchHit] = []
-        for document in snapshot.documents {
+        let needles = ([full] + terms).filter { !$0.isEmpty }.map { (text: $0, bytes: Array($0.utf8)) }
+        let fullBytes = Array(full.utf8)
+        let termBytes = terms.map { Array($0.utf8) }
+        var scored: [(document: LibraryDocument, entry: LibrarySearchIndex.Entry, score: Int)] = []
+        for (document, entry) in zip(index.snapshot.documents, index.entries) {
             if Task.isCancelled { break }
-            let path = document.path.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            let body = document.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             var score = 0
             if query.isEmpty { score = 1 }
             else {
-                if path.contains(full) { score += 100 }
-                if body.contains(full) { score += 50 }
-                for term in terms {
-                    if path.contains(term) { score += 12 }
-                    if body.contains(term) { score += 3 }
+                if contains(entry.path, fullBytes) { score += 100 }
+                if contains(entry.body, fullBytes) { score += 50 }
+                for term in termBytes {
+                    if contains(entry.path, term) { score += 12 }
+                    if contains(entry.body, term) { score += 3 }
                 }
             }
-            guard score > 0 else { continue }
-            let firstMatch = ([full] + terms).filter { !$0.isEmpty }.compactMap { term in
-                document.text.range(of: term, options: [.caseInsensitive, .diacriticInsensitive])
-            }.min { $0.lowerBound < $1.lowerBound }
-            let start = firstMatch.map { document.text.index($0.lowerBound, offsetBy: -45, limitedBy: document.text.startIndex) ?? document.text.startIndex } ?? document.text.startIndex
-            let snippet = String(document.text[start...].prefix(220)).replacingOccurrences(of: "\n", with: " ")
-            results.append(LibrarySearchHit(document: document, snippet: snippet, score: score))
+            if score > 0 { scored.append((document, entry, score)) }
         }
-        return results.sorted {
+        scored.sort {
             if $0.score != $1.score { return $0.score > $1.score }
             if $0.document.modified != $1.document.modified { return $0.document.modified > $1.document.modified }
             return $0.document.path < $1.document.path
         }
+        return scored.enumerated().map { offset, hit in
+            LibrarySearchHit(document: hit.document, snippet: offset < snippetLimit ? snippet(hit.document.text, entry: hit.entry, needles: needles) : "", score: hit.score)
+        }
+    }
+    private static func firstOffset(_ haystack: [UInt8], _ needle: [UInt8]) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        return haystack.withUnsafeBytes { h in
+            needle.withUnsafeBytes { n in
+                memmem(h.baseAddress, h.count, n.baseAddress, n.count).map { h.baseAddress!.distance(to: UnsafeRawPointer($0)) }
+            }
+        }
+    }
+    private static func contains(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool { firstOffset(haystack, needle) != nil }
+    private static func snippet(_ text: String, entry: LibrarySearchIndex.Entry, needles: [(text: String, bytes: [UInt8])]) -> String {
+        let lower: String.Index?
+        if entry.aligned {
+            // Locate the match in the folded bytes and carry its character offset over.
+            lower = needles.compactMap { firstOffset(entry.body, $0.bytes) }.min().map { offset in
+                text.index(text.startIndex, offsetBy: String(decoding: entry.body[..<offset], as: UTF8.self).count, limitedBy: text.endIndex) ?? text.startIndex
+            }
+        } else {
+            lower = needles.compactMap { text.range(of: $0.text, options: [.caseInsensitive, .diacriticInsensitive])?.lowerBound }.min()
+        }
+        let start = lower.map { text.index($0, offsetBy: -45, limitedBy: text.startIndex) ?? text.startIndex } ?? text.startIndex
+        return String(text[start...].prefix(220)).replacingOccurrences(of: "\n", with: " ")
     }
 }
 
